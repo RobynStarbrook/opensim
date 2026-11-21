@@ -82,6 +82,76 @@ namespace OpenSim.Region.ClientStack.Linden
         private static object m_loadLock = new object();
         protected IUserManagement m_UserManagement = null;
 
+        /// <summary>
+        /// Per agent byte rate limit for asset caps (GetTexture, GetMesh, GetMesh2, ViewerAsset).
+        /// 0 disables. Viewers that open many parallel connections can otherwise saturate the
+        /// server uplink, since these HTTP responses are not covered by the UDP throttles.
+        /// </summary>
+        private static int m_maxBytesPerSecPerAgent = 0;
+        private static readonly Dictionary<UUID, AgentAssetBudget> m_agentBudgets = new();
+
+        /// <summary>
+        /// Token bucket shared by all asset caps of one agent, across all regions of this instance.
+        /// Tokens may go negative so assets larger than the bucket still get sent; the debt
+        /// then delays the agent's following responses.
+        /// </summary>
+        private sealed class AgentAssetBudget
+        {
+            public int RefCount;
+            private readonly object m_lock = new();
+            private readonly double m_ratePerMS;
+            private readonly double m_burst;
+            private double m_tokens;
+            private double m_lastMS;
+
+            public AgentAssetBudget(int bytesPerSec)
+            {
+                m_ratePerMS = bytesPerSec * 1e-3;
+                m_burst = bytesPerSec; // one second worth
+                m_tokens = m_burst;
+                m_lastMS = Util.GetTimeStampMS();
+            }
+
+            public bool TryConsume(int bytes)
+            {
+                lock (m_lock)
+                {
+                    double now = Util.GetTimeStampMS();
+                    m_tokens = Math.Min(m_burst, m_tokens + (now - m_lastMS) * m_ratePerMS);
+                    m_lastMS = now;
+                    if (m_tokens <= 0)
+                        return false;
+                    m_tokens -= bytes;
+                    return true;
+                }
+            }
+        }
+
+        private static AgentAssetBudget AcquireBudget(UUID agentID)
+        {
+            if (m_maxBytesPerSecPerAgent <= 0)
+                return null;
+            lock (m_agentBudgets)
+            {
+                if (!m_agentBudgets.TryGetValue(agentID, out AgentAssetBudget budget))
+                {
+                    budget = new AgentAssetBudget(m_maxBytesPerSecPerAgent);
+                    m_agentBudgets[agentID] = budget;
+                }
+                budget.RefCount++;
+                return budget;
+            }
+        }
+
+        private static void ReleaseBudget(UUID agentID, Caps _)
+        {
+            lock (m_agentBudgets)
+            {
+                if (m_agentBudgets.TryGetValue(agentID, out AgentAssetBudget budget) && --budget.RefCount <= 0)
+                    m_agentBudgets.Remove(agentID);
+            }
+        }
+
         #region Region Module interfaceBase Members
 
         public Type ReplaceableInterface
@@ -110,6 +180,11 @@ namespace OpenSim.Region.ClientStack.Linden
             m_GetAssetURL = config.GetString("Cap_GetAsset", string.Empty);
             if (m_GetAssetURL != string.Empty)
                 m_Enabled = true;
+
+            int maxbps = config.GetInt("AssetsMaxBytesPerSecPerAgent", 0);
+            if (maxbps > 0 && maxbps < 32000)
+                maxbps = 32000; // below ~256kbps viewers start timing out fetches
+            m_maxBytesPerSecPerAgent = maxbps > 0 ? maxbps : 0;
         }
 
         public void AddRegion(Scene pScene)
@@ -126,6 +201,7 @@ namespace OpenSim.Region.ClientStack.Linden
                 return;
 
             s.EventManager.OnRegisterCaps -= RegisterCaps;
+            s.EventManager.OnDeregisterCaps -= ReleaseBudget;
             m_NumberScenes--;
             m_scene = null;
         }
@@ -154,6 +230,11 @@ namespace OpenSim.Region.ClientStack.Linden
                     m_UserManagement = s.RequestModuleInterface<IUserManagement>();
 
                 s.EventManager.OnRegisterCaps += RegisterCaps;
+                if (m_maxBytesPerSecPerAgent > 0)
+                {
+                    s.EventManager.OnDeregisterCaps += ReleaseBudget;
+                    m_log.Info($"[GETASSETS]: asset caps limited to {m_maxBytesPerSecPerAgent} bytes/s per agent in {s.Name}");
+                }
 
                 m_NumberScenes++;
 
@@ -193,17 +274,25 @@ namespace OpenSim.Region.ClientStack.Linden
 
             private Scene m_scene;
             private string m_hgassets = null;
-            public PollServiceAssetEventArgs(string uri, UUID pId, Scene scene, string HGAssetSVC) :
+            private readonly AgentAssetBudget m_budget;
+            public PollServiceAssetEventArgs(string uri, UUID pId, Scene scene, string HGAssetSVC, AgentAssetBudget budget) :
                 base(null, uri, null, null, null, null, pId, int.MaxValue)
             {
                 m_scene = scene;
                 m_hgassets = HGAssetSVC;
+                m_budget = budget;
 
+                // GetEvents is called right after this returns true, so charging the budget here is safe.
+                // If over budget the poll manager requeues the request and asks again in ~100ms.
                 HasEvents = delegate(UUID requestID, UUID _)
                 {
                     lock (responses)
                     {
-                        return responses.ContainsKey(requestID);
+                        if (!responses.TryGetValue(requestID, out APollResponse apr))
+                            return false;
+                        if (m_budget is null)
+                            return true;
+                        return m_budget.TryConsume(apr.osresponse.RawBufferLen);
                     }
                 };
 
@@ -344,6 +433,9 @@ namespace OpenSim.Region.ClientStack.Linden
 
             IExternalCapsModule handler = m_scene.RequestModuleInterface<IExternalCapsModule>();
 
+            // one budget per agent, shared by all its asset caps in all regions of this instance
+            AgentAssetBudget budget = AcquireBudget(agentID);
+
             if (m_GetTextureURL.Equals("localhost"))
             {
                 string capUrl = "/" + UUID.Random();
@@ -351,7 +443,7 @@ namespace OpenSim.Region.ClientStack.Linden
                 if (handler != null)
                     handler.RegisterExternalUserCapsHandler(agentID, caps, "GetTexture", capUrl);
                 else
-                    caps.RegisterPollHandler("GetTexture", new PollServiceAssetEventArgs(capUrl, agentID, m_scene, hgassets));
+                    caps.RegisterPollHandler("GetTexture", new PollServiceAssetEventArgs(capUrl, agentID, m_scene, hgassets, budget));
             }
             else
             {
@@ -366,7 +458,7 @@ namespace OpenSim.Region.ClientStack.Linden
                 if (handler != null)
                     handler.RegisterExternalUserCapsHandler(agentID, caps, "GetMesh", capUrl);
                 else
-                    caps.RegisterPollHandler("GetMesh", new PollServiceAssetEventArgs(capUrl, agentID, m_scene, hgassets));
+                    caps.RegisterPollHandler("GetMesh", new PollServiceAssetEventArgs(capUrl, agentID, m_scene, hgassets, budget));
             }
             else if (!string.IsNullOrEmpty(m_GetMeshURL))
                 caps.RegisterHandler("GetMesh", m_GetMeshURL);
@@ -379,7 +471,7 @@ namespace OpenSim.Region.ClientStack.Linden
                 if (handler != null)
                     handler.RegisterExternalUserCapsHandler(agentID, caps, "GetMesh2", capUrl);
                 else
-                    caps.RegisterPollHandler("GetMesh2", new PollServiceAssetEventArgs(capUrl, agentID, m_scene, hgassets));
+                    caps.RegisterPollHandler("GetMesh2", new PollServiceAssetEventArgs(capUrl, agentID, m_scene, hgassets, budget));
             }
             else if (!string.IsNullOrEmpty(m_GetMesh2URL))
                 caps.RegisterHandler("GetMesh2", m_GetMesh2URL);
@@ -392,7 +484,7 @@ namespace OpenSim.Region.ClientStack.Linden
                 if (handler != null)
                     handler.RegisterExternalUserCapsHandler(agentID, caps, "ViewerAsset", capUrl);
                 else
-                    caps.RegisterPollHandler("ViewerAsset", new PollServiceAssetEventArgs(capUrl, agentID, m_scene, hgassets));
+                    caps.RegisterPollHandler("ViewerAsset", new PollServiceAssetEventArgs(capUrl, agentID, m_scene, hgassets, budget));
             }
             else if (!string.IsNullOrEmpty(m_GetAssetURL))
                 caps.RegisterHandler("ViewerAsset", m_GetAssetURL);
